@@ -27,7 +27,10 @@ import static lombok.javac.Javac.*;
 
 import java.util.Collection;
 
+import com.sun.tools.javac.util.ListBuffer;
+import com.sun.tools.javac.util.Name;
 import lombok.ConfigurationKeys;
+import lombok.Desensitizer;
 import lombok.ToString;
 import lombok.core.AnnotationValues;
 import lombok.core.configuration.CallSuperType;
@@ -84,7 +87,7 @@ public class HandleToString extends JavacAnnotationHandler<ToString> {
 		
 		generateToString(annotationNode.up(), annotationNode, members, includeNames, callSuper, true, fieldAccess);
 	}
-	
+
 	public void generateToStringForType(JavacNode typeNode, JavacNode errorNode) {
 		if (hasAnnotation(ToString.class, typeNode)) {
 			//The annotation will make it happen, so we can skip it.
@@ -106,7 +109,7 @@ public class HandleToString extends JavacAnnotationHandler<ToString> {
 	
 	public void generateToString(JavacNode typeNode, JavacNode source, java.util.List<Included<JavacNode, ToString.Include>> members,
 		boolean includeFieldNames, Boolean callSuper, boolean whineIfExists, FieldAccess fieldAccess) {
-		
+		generateDesensitizerForType(typeNode, source);
 		boolean notAClass = true;
 		if (typeNode.get() instanceof JCClassDecl) {
 			long flags = ((JCClassDecl) typeNode.get()).mods.flags;
@@ -214,7 +217,7 @@ public class HandleToString extends JavacAnnotationHandler<ToString> {
 			if (memberNode.getKind() == Kind.METHOD) {
 				memberAccessor = createMethodAccessor(maker, memberNode);
 			} else {
-				memberAccessor = createFieldAccessor(maker, memberNode, fieldAccess);
+				memberAccessor = createDesensitizeFieldAccessor(maker, memberNode, fieldAccess);
 			}
 			
 			JCExpression memberType = getFieldType(memberNode, fieldAccess);
@@ -258,7 +261,124 @@ public class HandleToString extends JavacAnnotationHandler<ToString> {
 		createRelevantNonNullAnnotation(typeNode, methodDef);
 		return recursiveSetGeneratedBy(methodDef, source, typeNode.getContext());
 	}
-	
+
+	private static void generateDesensitizerForType(JavacNode typeNode, JavacNode source) {
+		boolean hasAnnotation = false;
+		for (JavacNode field : typeNode.down()) {
+			if (hasAnnotation(Desensitizer.class, field)) {
+				hasAnnotation = true;
+			}
+		}
+		MemberExistsResult result = methodExists("desensitize", typeNode, 4);
+		if (hasAnnotation && MemberExistsResult.NOT_EXISTS == result) {
+			createDesensitizeMethod(typeNode, source);
+		}
+	}
+
+	/**
+	 * <pre>
+	 *     private String desensitize(Object input, int preLen, int sufLen, String cipher) {
+	 *         if (input == null) {
+	 *             return null;
+	 *         }
+	 *         String str = input.toString();
+	 *         int len = str.length();
+	 *         if (len <= preLen + sufLen) {
+	 *             return str;
+	 *         }
+	 *         StringBuilder sb = new StringBuilder();
+	 *         for (int i = 0; i < len; ++i) {
+	 *             if (i >= preLen && i < len - sufLen) {
+	 *                 sb.append(cipher);
+	 *                 continue;
+	 *             }
+	 *             sb.append(str.charAt(i));
+	 *         }
+	 *         return sb.toString();
+	 *     }
+	 * </pre>
+	 */
+	private static void createDesensitizeMethod(JavacNode typeNode, JavacNode source) {
+		JCExpression stringType = genJavaLangTypeRef(typeNode, "String");
+		JCExpression objectType = genJavaLangTypeRef(typeNode, "Object");
+		JCExpression stringBuilderType = genJavaLangTypeRef(typeNode, "StringBuilder");
+		Name inputName = typeNode.toName("input");
+		Name preLenName = typeNode.toName("preLen");
+		Name sufLenName = typeNode.toName("sufLen");
+		Name cipherName = typeNode.toName("cipher");
+		Name desensitize = typeNode.toName("desensitize");
+		Name sbName = typeNode.toName("sb");
+		JavacTreeMaker maker = typeNode.getTreeMaker();
+		JCVariableDecl input = maker.VarDef(maker.Modifiers(Flags.PARAMETER), inputName, objectType, null);
+		JCVariableDecl preLen = maker.VarDef(maker.Modifiers(Flags.PARAMETER), preLenName, maker.TypeIdent(CTC_INT), null);
+		JCVariableDecl sufLen = maker.VarDef(maker.Modifiers(Flags.PARAMETER), sufLenName, maker.TypeIdent(CTC_INT), null);
+		JCVariableDecl cipher = maker.VarDef(maker.Modifiers(Flags.PARAMETER), cipherName, stringType, null);
+		// Object input, int preLen, int sufLen, String cipher
+		List<JCVariableDecl> variableDecls = List.from(new JCVariableDecl[] {input, preLen, sufLen, cipher});
+		ListBuffer<JCStatement> statements = new ListBuffer<JCStatement>();
+
+		// if (input == null) return null;
+		statements.append(maker.If(maker.Binary(CTC_EQUAL, maker.Ident(inputName), maker.Literal(CTC_BOT, null)), maker.Return(maker.Literal(CTC_BOT, null)), null));
+
+		// String str= input.toString();
+		Name strName = typeNode.toName("str");
+		Name lenName = typeNode.toName("len");
+		JCExpression inputString = maker.Apply(List.<JCExpression>nil(), maker.Select(maker.Ident(inputName), typeNode.toName("toString")), List.<JCExpression>nil());
+		statements.append(maker.VarDef(maker.Modifiers(0), strName, stringType, inputString));
+
+		// int len = str.length();
+		JCExpression strLength = maker.Apply(List.<JCExpression>nil(), maker.Select(maker.Ident(strName), typeNode.toName("length")), List.<JCExpression>nil());
+		statements.append(maker.VarDef(maker.Modifiers(0), lenName, maker.TypeIdent(CTC_INT), strLength));
+
+		// if (len <= preLen + sufLen) return str;
+		statements.append(maker.If(maker.Binary(CTC_LESS_OR_EQUAL, maker.Ident(lenName), maker.Binary(CTC_PLUS, maker.Ident(preLenName), maker.Ident(sufLenName))), maker.Return(maker.Ident(strName)), null));
+
+		// for (int i = 0; i < len; ++i)
+		Name iName = typeNode.toName("i");
+		JCTree.JCNewClass clazz = maker.NewClass(null, List.<JCExpression>nil(), stringBuilderType, List.<JCExpression>nil(), null);
+		statements.append(maker.VarDef(maker.Modifiers(0), sbName, stringBuilderType, clazz));
+		List<JCStatement> forInit = List.<JCStatement>of(maker.VarDef(maker.Modifiers(0), iName, maker.TypeIdent(CTC_INT), maker.Literal(0)));
+		JCExpression forCond = maker.Binary(CTC_LESS_THAN, maker.Ident(iName), maker.Ident(lenName));
+		List<JCTree.JCExpressionStatement> forStep = List.of(maker.Exec(maker.Unary(CTC_PREINC, maker.Ident(iName))));
+		ListBuffer<JCStatement> forStatement = new ListBuffer<JCStatement>();
+
+		// i >= preLen && i < len - sufLen
+		JCExpression ifCond = maker.Binary(
+				JavacTreeMaker.TreeTag.treeTag("AND"),
+				maker.Binary(CTC_GREATER_OR_EQUAL, maker.Ident(iName), maker.Ident(preLenName)),
+				maker.Binary(CTC_LESS_THAN, maker.Ident(iName), maker.Binary(CTC_MINUS, maker.Ident(lenName), maker.Ident(sufLenName)))
+		);
+		ListBuffer<JCStatement> ifStatements = new ListBuffer<JCStatement>();
+		// sb.append(cipher);
+		JCMethodInvocation inv = maker.Apply(List.<JCExpression>nil(), maker.Select(maker.Ident(sbName), typeNode.toName("append")), List.<JCExpression>of(maker.Ident(cipherName)));
+		ifStatements.append(maker.Exec(inv));
+		ifStatements.append(maker.Continue(null));
+		forStatement.append(maker.If(ifCond, maker.Block(0, ifStatements.toList()), null));
+		//str.chatAt(i)
+		JCExpression charAt = maker.Apply(List.<JCExpression>nil(), maker.Select(maker.Ident(strName), typeNode.toName("charAt")), List.<JCExpression>of(maker.Ident(iName)));
+		// sb.append(str.chartAt(i))
+		JCExpression append = maker.Apply(List.<JCExpression>nil(), maker.Select(maker.Ident(sbName), typeNode.toName("append")), List.<JCExpression>of(charAt));
+		forStatement.append(maker.Exec(append));
+		statements.append(maker.ForLoop(forInit, forCond, forStep, maker.Block(0, forStatement.toList())));
+		JCExpression sbToString = maker.Apply(List.<JCExpression>nil(), maker.Select(maker.Ident(sbName), typeNode.toName("toString")), List.<JCExpression>nil());
+		statements.append(maker.Return(sbToString));
+		JCMethodDecl methodDec = maker.MethodDef(maker.Modifiers(Flags.PRIVATE), desensitize, stringType, List.<JCTypeParameter>nil(), variableDecls, List.<JCExpression>nil(), maker.Block(0, statements.toList()), null);
+		recursiveSetGeneratedBy(methodDec, source.get(), typeNode.getContext());
+		injectMethod(typeNode, methodDec);
+	}
+
+	private static JCExpression createDesensitizeFieldAccessor(JavacTreeMaker maker, JavacNode field, FieldAccess fieldAccess) {
+		JCExpression exp = createFieldAccessor(maker, field, fieldAccess, null);
+		JavacNode anno = findAnnotation(Desensitizer.class, field);
+		if (anno == null) {
+			return exp;
+		}
+		Desensitizer desensitizer = createAnnotation(Desensitizer.class, (JCAnnotation) anno.get(), field).getInstance();
+		JCExpression deMethod = chainDotsString(field.up(), "this.desensitize");
+		List<JCExpression> args = List.from(new JCExpression[] {exp, maker.Literal(desensitizer.preLen()), maker.Literal(desensitizer.sufLen()), maker.Literal(desensitizer.cipher())});
+		return maker.Apply(List.<JCExpression>nil(), deMethod, args);
+	}
+
 	public static String getTypeName(JavacNode typeNode) {
 		String typeName = ((JCClassDecl) typeNode.get()).name.toString();
 		JavacNode upType = typeNode.up();
