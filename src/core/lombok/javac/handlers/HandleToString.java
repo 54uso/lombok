@@ -25,12 +25,14 @@ import static lombok.core.handlers.HandlerUtil.*;
 import static lombok.javac.handlers.JavacHandlerUtil.*;
 import static lombok.javac.Javac.*;
 
+import java.lang.annotation.Annotation;
+import java.lang.reflect.Method;
 import java.util.Collection;
 
 import com.sun.tools.javac.util.ListBuffer;
 import com.sun.tools.javac.util.Name;
 import lombok.ConfigurationKeys;
-import lombok.Desensitizer;
+import lombok.extern.desensitizer.Desensitizer;
 import lombok.ToString;
 import lombok.core.AnnotationValues;
 import lombok.core.configuration.CallSuperType;
@@ -262,11 +264,49 @@ public class HandleToString extends JavacAnnotationHandler<ToString> {
 		return recursiveSetGeneratedBy(methodDef, source, typeNode.getContext());
 	}
 
+	private static Desensitizer getDesensitizerAnnotation(JavacNode field) {
+		if (field.getKind() != Kind.FIELD) {
+			return null;
+		}
+		for (JavacNode child : field.down()) {
+			if (annotationTypeMatches(Desensitizer.class, child)) {
+				return createAnnotation(Desensitizer.class, (JCAnnotation) child.get(), field).getInstance();
+			}
+			if (child.getKind() == Kind.ANNOTATION) {
+				String anno = ((JCAnnotation) child.get()).getAnnotationType().type.toString();
+				try {
+					Class<? extends Annotation> clazz = (Class<? extends Annotation>) Class.forName(anno);
+					Object ins = createAnnotation(clazz, (JCAnnotation) child.get(), field).getInstance();
+					for (Method method : clazz.getMethods()) {
+						if (method.getName().equals("desensitizer") && method.getReturnType().isAssignableFrom(Desensitizer.class)) {
+							return (Desensitizer) method.invoke(ins);
+						}
+					}
+				} catch (Exception ex) {
+					throw new RuntimeException(ex);
+				}
+			}
+		}
+		String name = field.getName();
+		String clazzName = "lombok.extern.desensitizer.common." + name.substring(0, 1).toUpperCase() + name.substring(1);
+		try {
+			Class<? extends Annotation> clazz = (Class<? extends Annotation>) Class.forName(clazzName);
+			for (Method method : clazz.getMethods()) {
+				if (method.getName().equals("desensitizer") && method.getReturnType().isAssignableFrom(Desensitizer.class)) {
+					return (Desensitizer) method.getDefaultValue();
+				}
+			}
+		} catch (ClassNotFoundException ex) {
+		}
+		return null;
+	}
+
 	private static void generateDesensitizerForType(JavacNode typeNode, JavacNode source) {
 		boolean hasAnnotation = false;
 		for (JavacNode field : typeNode.down()) {
-			if (hasAnnotation(Desensitizer.class, field)) {
+			if (getDesensitizerAnnotation(field) != null) {
 				hasAnnotation = true;
+				break;
 			}
 		}
 		MemberExistsResult result = methodExists("desensitize", typeNode, 4);
@@ -369,11 +409,10 @@ public class HandleToString extends JavacAnnotationHandler<ToString> {
 
 	private static JCExpression createDesensitizeFieldAccessor(JavacTreeMaker maker, JavacNode field, FieldAccess fieldAccess) {
 		JCExpression exp = createFieldAccessor(maker, field, fieldAccess, null);
-		JavacNode anno = findAnnotation(Desensitizer.class, field);
-		if (anno == null) {
+		Desensitizer desensitizer = getDesensitizerAnnotation(field);
+		if (desensitizer == null) {
 			return exp;
 		}
-		Desensitizer desensitizer = createAnnotation(Desensitizer.class, (JCAnnotation) anno.get(), field).getInstance();
 		JCExpression deMethod = chainDotsString(field.up(), "this.desensitize");
 		List<JCExpression> args = List.from(new JCExpression[] {exp, maker.Literal(desensitizer.preLen()), maker.Literal(desensitizer.sufLen()), maker.Literal(desensitizer.cipher())});
 		return maker.Apply(List.<JCExpression>nil(), deMethod, args);
@@ -388,4 +427,13 @@ public class HandleToString extends JavacAnnotationHandler<ToString> {
 		}
 		return typeName;
 	}
+
+	private static Class loadClass(String name) {
+		try {
+			return Class.forName(name);
+		} catch (ClassNotFoundException e) {
+			return null;
+		}
+	}
+
 }
